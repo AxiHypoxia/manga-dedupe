@@ -1,4 +1,4 @@
-﻿package com.example.mangadedupe;
+package com.example.mangadedupe;
 
 import android.app.Activity;
 import android.os.Bundle;
@@ -28,7 +28,7 @@ public class MainActivity extends Activity {
 
         TextView info = new TextView(this);
         info.setText("编译链路验证版\n\n"
-                + "构建时间：内置在 BuildConfig 之外的常量，仅用于确认 APK 能装上并打开。\n\n"
+                + "看到这行字说明：代码编译、APK 打包、下载安装、启动 全部正常。\n\n"
                 + "下一步将替换为：\n"
                 + "· 分组网格（2 列，首版本封面）\n"
                 + "· 组详情 / 多选\n"
