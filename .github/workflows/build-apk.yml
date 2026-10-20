@@ -1,0 +1,52 @@
+name: build-apk
+
+on:
+  push:
+    paths:
+      - "android/**"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件
+        run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" 2>&1 | tee build-log-sdk.txt
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: 单元测试（判定逻辑，纯 JVM）
+        working-directory: android
+        run: gradle testDebugUnitTest --no-daemon 2>&1 | tee ../build-log-test.txt
+
+      - name: 构建 Debug APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon 2>&1 | tee ../build-log-apk.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manga-dedupe-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: |
+            build-log-*.txt
+            android/app/build/reports/tests/**
+          if-no-files-found: warn
