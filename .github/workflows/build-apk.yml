@@ -9,7 +9,6 @@ on:
 
 jobs:
   apk:
-    # 锁 22.04：自带 Android SDK，避开 ubuntu-latest 迁到 Ubuntu 26 的变动
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -19,22 +18,28 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # Windows 编辑器会在文件头写 BOM，javac 会报 illegal character: '\ufeff'
+      - name: 去掉文件 BOM
+        run: |
+          set -e
+          find android -type f \( -name "*.java" -o -name "*.kt" -o -name "*.gradle" \
+            -o -name "*.xml" -o -name "*.properties" -o -name "*.pro" \) -print0 \
+            | xargs -0 -r sed -i '1s/^\xEF\xBB\xBF//'
+          echo "--- 清理后首字节（应是 p a c）---"
+          head -c 8 android/app/src/main/java/com/example/mangadedupe/MainActivity.java | od -c | head -2
+
       - name: Android SDK 准备
         run: |
           set -e
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           echo "SDK=$SDK"
-          ls -d "$SDK"/platforms/* 2>/dev/null | head -5 || true
-          export PATH="$PATH:$SDK/cmdline-tools/latest/bin:$SDK/cmdline-tools/bin:$SDK/tools/bin"
+          export PATH="$PATH:$SDK/cmdline-tools/latest/bin:$SDK/tools/bin"
           if command -v sdkmanager >/dev/null 2>&1; then
             yes | sdkmanager --licenses > /dev/null 2>&1 || true
-            sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" 2>&1 | tail -20 || true
-          else
-            echo "sdkmanager 不在 PATH，依赖镜像自带组件"
+            sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" 2>&1 | tail -5 || true
           fi
           mkdir -p android
           printf 'sdk.dir=%s\n' "$SDK" > android/local.properties
-          cat android/local.properties
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -42,15 +47,23 @@ jobs:
 
       - name: 单元测试（判定逻辑，纯 JVM）
         working-directory: android
-        run: gradle testDebugUnitTest --no-daemon 2>&1 | tee ../build-log-test.txt
+        run: |
+          set -o pipefail
+          gradle testDebugUnitTest --no-daemon 2>&1 | tee ../build-log-test.txt
 
       - name: 构建 Debug APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon 2>&1 | tee ../build-log-apk.txt
-
-      - name: 显示产物
         run: |
-          ls -lh android/app/build/outputs/apk/debug/ || true
+          set -o pipefail
+          gradle assembleDebug --no-daemon 2>&1 | tee ../build-log-apk.txt
+
+      # 没有 APK 就让这步失败，避免“绿了但没产物”
+      - name: 断言 APK 存在
+        run: |
+          set -e
+          find android/app/build/outputs -type f 2>/dev/null | head -20 || true
+          test -s android/app/build/outputs/apk/debug/app-debug.apk
+          ls -lh android/app/build/outputs/apk/debug/
 
       - uses: actions/upload-artifact@v4
         if: always()
