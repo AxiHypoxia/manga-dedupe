@@ -10,8 +10,8 @@ android {
         applicationId "com.example.mangadedupe"
         minSdk 24
         targetSdk 34
-        versionCode 4
-        versionName "0.3.1-scan-fast"
+        versionCode 5
+        versionName "0.4.0-fastfile"
     }
 
     buildTypes {

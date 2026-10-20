@@ -1,59 +1,68 @@
 package com.example.mangadedupe;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.UriPermission;
+import android.content.pm.PackageManager;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
-import android.util.Log;
+import android.os.Environment;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import java.io.File;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 
 /**
- * 界面：选目录 → 两阶段扫描 → 2 列分组网格。
- *
- * SAF 授权说明（国产 ROM 常见坑）：
- *  · 必须带 FLAG_GRANT_PREFIX_URI_PERMISSION，否则部分 ROM 会“允许后反复再问”
- *  · READ / WRITE 分开申请，写权限被拒不影响只读扫描
- *  · 选中的目录存进 SharedPreferences，进程被杀也不会丢
+ * 快速模式界面：申请「所有文件访问权限」→ 内置目录浏览 → 两阶段扫描 → 分组网格。
+ * 不再走 SAF / 系统文件选择器（部分 ROM 上 DocumentsUI 会转圈转不出来）。
  */
 public class MainActivity extends Activity {
 
-    private static final String TAG = "MangaDedupe";
-    private static final int REQ_TREE = 1001;
-    private static final String PREFS = "mangadedupe";
-    private static final String KEY_TREE = "tree_uri";
+    private static final int REQ_ALL_FILES = 2001;
+    private static final int REQ_READ = 2002;
 
     private static final int BG = 0xFF0F0F11;
     private static final int TEXT = 0xFFEDEDEF;
     private static final int SUB = 0xFF8A8D94;
+    private static final int ACCENT = 0xFF4C8DFF;
 
     private TextView status;
+    private TextView pathText;
     private TextView empty;
-    private Button pickBtn;
+    private LinearLayout browseList;
+    private ScrollView browseScroll;
+    private RecyclerView rv;
+    private Button authBtn;
+    private Button browseBtn;
+    private Button upBtn;
+    private Button useBtn;
     private Button depthBtn;
     private Button scanBtn;
+
     private GroupAdapter adapter;
     private ImageLoader loader;
 
-    private Uri treeUri;
+    private File currentDir;
+    private File chosenDir;
     private int depth = 1;
     private boolean busy;
-    private boolean picking;
-    private SafScanner scanner;
+    private FileScanner scanner;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -63,8 +72,8 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG);
-        int pad = (int) (d * 14);
-        root.setPadding(pad, (int) (d * 10), pad, 0);
+        int pad = (int) (d * 12);
+        root.setPadding(pad, (int) (d * 8), pad, 0);
 
         TextView title = new TextView(this);
         title.setText("漫画重复筛选");
@@ -75,37 +84,68 @@ public class MainActivity extends Activity {
         status = new TextView(this);
         status.setTextSize(11);
         status.setTextColor(SUB);
-        status.setPadding(0, (int) (d * 4), 0, (int) (d * 8));
+        status.setPadding(0, (int) (d * 4), 0, (int) (d * 6));
         root.addView(status);
 
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        root.addView(bar);
+        pathText = new TextView(this);
+        pathText.setTextSize(12);
+        pathText.setTextColor(ACCENT);
+        pathText.setSingleLine(true);
+        pathText.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        pathText.setPadding(0, (int) (d * 4), 0, (int) (d * 4));
+        root.addView(pathText);
 
-        pickBtn = button("选目录");
-        bar.addView(pickBtn, lp(d, 0, 8));
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        root.addView(row1);
+        authBtn = button("授权");
+        row1.addView(authBtn, lp(d, 0, 6));
+        browseBtn = button("浏览");
+        row1.addView(browseBtn, lp(d, 0, 6));
+        upBtn = button("↑ 上级");
+        row1.addView(upBtn, lp(d, 0, 0));
 
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams row2lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        row2lp.topMargin = (int) (d * 6);
+        root.addView(row2, row2lp);
+        useBtn = button("用这个目录");
+        row2.addView(useBtn, lp(d, 0, 6));
         depthBtn = button("层数 1");
-        bar.addView(depthBtn, lp(d, 0, 8));
-
+        row2.addView(depthBtn, lp(d, 0, 6));
         scanBtn = button("扫描");
-        bar.addView(scanBtn, lp(d, 0, 0));
+        row2.addView(scanBtn, lp(d, 0, 0));
 
-        RecyclerView rv = new RecyclerView(this);
-        LinearLayout.LayoutParams rvlp = new LinearLayout.LayoutParams(
+        // 中间区域：浏览列表 / 结果网格 二选一
+        android.widget.FrameLayout content = new android.widget.FrameLayout(this);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        rvlp.topMargin = (int) (d * 10);
-        root.addView(rv, rvlp);
+        clp.topMargin = (int) (d * 8);
+        root.addView(content, clp);
+
+        browseScroll = new ScrollView(this);
+        browseList = new LinearLayout(this);
+        browseList.setOrientation(LinearLayout.VERTICAL);
+        browseScroll.addView(browseList);
+        content.addView(browseScroll, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        rv = new RecyclerView(this);
         rv.setLayoutManager(new GridLayoutManager(this, 2));
         rv.addItemDecoration(new GridSpace((int) (d * 6)));
+        rv.setVisibility(View.GONE);
+        content.addView(rv, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         empty = new TextView(this);
-        empty.setText("还没有结果\n\n1. 点「选目录」选择漫画根目录\n2. 选「层数」（第几层文件夹算一部作品）\n3. 点「扫描」");
         empty.setTextSize(12);
         empty.setTextColor(SUB);
         empty.setGravity(Gravity.CENTER);
-        empty.setPadding(pad, (int) (d * 40), pad, 0);
-        root.addView(empty);
+        empty.setVisibility(View.GONE);
+        content.addView(empty, new android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         setContentView(root);
 
@@ -125,26 +165,45 @@ public class MainActivity extends Activity {
         });
         rv.setAdapter(adapter);
 
-        // 恢复上次选的目录
-        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        String saved = sp.getString(KEY_TREE, null);
-        if (saved != null) {
-            try {
-                treeUri = Uri.parse(saved);
-                status.setText("上次选的目录：" + uriName(treeUri) + "\n" + permText(treeUri));
-            } catch (Exception ignored) {
-            }
-        } else {
-            status.setText("选一个漫画根目录（会请求读写授权，用于改名标记）");
-        }
-
-        pickBtn.setOnClickListener(new View.OnClickListener() {
+        authBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                pickTree();
+                requestAccess();
             }
         });
-
+        browseBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (currentDir != null) browse(currentDir);
+            }
+        });
+        upBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (currentDir == null) return;
+                File p = currentDir.getParentFile();
+                if (p == null) {
+                    Toast.makeText(MainActivity.this, "已经到顶了", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                browse(p);
+            }
+        });
+        useBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (currentDir == null) {
+                    Toast.makeText(MainActivity.this, "先浏览到一个目录", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                chosenDir = currentDir;
+                browseScroll.setVisibility(View.GONE);
+                rv.setVisibility(View.VISIBLE);
+                empty.setVisibility(View.GONE);
+                status.setText("已选目录：" + chosenDir.getAbsolutePath()
+                        + "\n点「层数」调整，然后点「扫描」");
+            }
+        });
         depthBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -152,7 +211,6 @@ public class MainActivity extends Activity {
                 depthBtn.setText("层数 " + depth);
             }
         });
-
         scanBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -167,110 +225,166 @@ public class MainActivity extends Activity {
         });
     }
 
-    // ---------------- SAF ----------------
-
-    private void pickTree() {
-        if (picking) {
-            Toast.makeText(this, "授权窗口已经打开了，请在里面操作", Toast.LENGTH_SHORT).show();
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (!hasAccess()) {
+            status.setText("需要「所有文件访问权限」才能直接读取手机文件"
+                    + "\n点「授权」→ 在系统设置里打开开关 → 返回");
+            authBtn.setVisibility(View.VISIBLE);
             return;
         }
-        picking = true;
-        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
-        // 关键：PREFIX 标志让整个子树一起授权，部分 ROM 缺它会“允许后反复再问”
-        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
-                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
-        try {
-            startActivityForResult(i, REQ_TREE);
-            Log.i(TAG, "打开目录选择器");
-        } catch (Exception e) {
-            picking = false;
-            Toast.makeText(this, "打不开目录选择器：" + e, Toast.LENGTH_LONG).show();
+        authBtn.setVisibility(View.GONE);
+        if (currentDir == null || browseList.getChildCount() == 0) {
+            File start = Environment.getExternalStorageDirectory();
+            browse(start);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_READ) {
+            if (hasAccess()) {
+                browse(Environment.getExternalStorageDirectory());
+            } else {
+                status.setText("没拿到读取权限，无法扫描");
+            }
         }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_TREE) return;
-        picking = false;
-
-        if (resultCode != RESULT_OK) {
-            // 常见于：用户按了返回、或 ROM 把确认框当成了取消
-            status.setText("没有选到目录（结果码 " + resultCode + "）\n再点一次「选目录」，在弹窗里先点「使用此文件夹」再允许");
-            Toast.makeText(this, "未选择目录（结果码 " + resultCode + "）", Toast.LENGTH_LONG).show();
-            Log.w(TAG, "onActivityResult not OK: " + resultCode);
-            return;
-        }
-        Uri uri = data == null ? null : data.getData();
-        if (uri == null) {
-            status.setText("系统返回了空目录（ROM 异常）\n试试：设置 → 应用 → 漫画重复筛选 → 权限 → 存储，手动允许");
-            Toast.makeText(this, "系统返回空目录", Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        // READ 与 WRITE 分开申请；WRITE 被拒不影响扫描，只是不能改名
-        boolean readOk = tryPersist(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        boolean writeOk = tryPersist(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-
-        treeUri = uri;
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_TREE, uri.toString()).apply();
-
-        String msg = "已选目录：" + uriName(uri) + "\n" + permText(uri);
-        status.setText(msg);
-        Toast.makeText(this, "已选择：" + uriName(uri)
-                + (writeOk ? "" : "\n（只读：能扫描，暂不能改名标记）"), Toast.LENGTH_LONG).show();
-        Log.i(TAG, "tree=" + uri + " readOk=" + readOk + " writeOk=" + writeOk);
-    }
-
-    private boolean tryPersist(Uri uri, int modeFlag) {
-        try {
-            getContentResolver().takePersistableUriPermission(uri, modeFlag);
-            return true;
-        } catch (Exception e) {
-            Log.w(TAG, "takePersistable failed for mode " + modeFlag, e);
-            return false;
+        if (requestCode == REQ_ALL_FILES) {
+            // 回来时 onResume 会重新检查
+            if (!hasAccess()) {
+                status.setText("还没打开「所有文件访问权限」\n"
+                        + "设置 → 应用 → 漫画重复筛选 → 权限 → 所有文件访问权限");
+            }
         }
     }
 
-    private String uriName(Uri uri) {
-        String s = uri.getLastPathSegment();
-        if (s == null) s = uri.toString();
-        int i = s.indexOf(':');
-        if (i >= 0) s = s.substring(i + 1);
-        return s;
+    // ---------------- 权限 ----------------
+
+    private boolean hasAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
-    /** 显示当前已持久化的权限（排查授权问题用） */
-    private String permText(Uri uri) {
-        boolean read = false;
-        boolean write = false;
-        try {
-            List<UriPermission> list = getContentResolver().getPersistedUriPermissions();
-            for (UriPermission p : list) {
-                if (p.getUri().equals(uri)) {
-                    read = p.isReadPermission();
-                    write = p.isWritePermission();
+    private void requestAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:" + getPackageName()));
+                startActivityForResult(i, REQ_ALL_FILES);
+            } catch (Exception e) {
+                try {
+                    startActivityForResult(
+                            new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                            REQ_ALL_FILES);
+                } catch (Exception e2) {
+                    Toast.makeText(this, "打不开设置页，请手动到：设置 → 应用 → 漫画重复筛选 → 权限",
+                            Toast.LENGTH_LONG).show();
                 }
             }
-        } catch (Exception ignored) {
+        } else {
+            requestPermissions(new String[]{
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_READ);
         }
-        String extra = "";
-        if (!read && !write) extra = "\n（未拿到持久授权：能扫描，重启后要重选）";
-        else if (!write) extra = "\n（只读授权：能扫描，不能改名）";
-        return "权限：读" + (read ? " √" : " ×") + " · 写" + (write ? " √" : " ×") + extra;
     }
 
-    // ---------------- 两阶段扫描 ----------------
+    // ---------------- 目录浏览 ----------------
+
+    private void browse(File dir) {
+        if (dir == null || !dir.isDirectory()) {
+            Toast.makeText(this, "不是有效目录", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!hasAccess() && !dir.canRead()) {
+            status.setText("没有权限读取该目录，请先点「授权」");
+            return;
+        }
+        currentDir = dir;
+        pathText.setText(dir.getAbsolutePath());
+        browseList.removeAllViews();
+        browseScroll.setVisibility(View.VISIBLE);
+        rv.setVisibility(View.GONE);
+        empty.setVisibility(View.GONE);
+
+        File parent = dir.getParentFile();
+        if (parent != null) {
+            addRow("↑ 上一级（" + parent.getName() + "）", parent, true);
+        }
+
+        File[] kids = dir.listFiles();
+        List<File> dirs = new ArrayList<File>();
+        int fileCount = 0;
+        if (kids != null) {
+            for (File f : kids) {
+                if (f.getName().startsWith(".")) continue;
+                if (f.isDirectory()) dirs.add(f);
+                else fileCount++;
+            }
+        }
+        Collections.sort(dirs, new Comparator<File>() {
+            @Override
+            public int compare(File a, File b) {
+                return a.getName().compareToIgnoreCase(b.getName());
+            }
+        });
+        for (File f : dirs) {
+            addRow("▸ " + f.getName(), f, false);
+        }
+        if (dirs.isEmpty() && fileCount == 0) {
+            addRow("（空目录）", null, false);
+        }
+        status.setText(dirs.size() + " 个子文件夹 · " + fileCount + " 个文件"
+                + " · 点文件夹进入，或点「用这个目录」直接选当前目录");
+    }
+
+    private void addRow(String text, final File target, boolean isUp) {
+        final float d = getResources().getDisplayMetrics().density;
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(14);
+        t.setTextColor(isUp ? SUB : TEXT);
+        t.setPadding((int) (d * 10), (int) (d * 12), (int) (d * 10), (int) (d * 12));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFF1A1B1E);
+        bg.setCornerRadius(d * 8);
+        t.setBackground(bg);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = (int) (d * 6);
+        t.setLayoutParams(lp);
+        if (target != null) {
+            t.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    browse(target);
+                }
+            });
+        }
+        browseList.addView(t);
+    }
+
+    // ---------------- 扫描 ----------------
 
     private void startScan() {
-        if (treeUri == null) {
-            Toast.makeText(this, "先点「选目录」", Toast.LENGTH_SHORT).show();
+        if (chosenDir == null) {
+            Toast.makeText(this, "先点「用这个目录」", Toast.LENGTH_SHORT).show();
             return;
         }
         busy = true;
-        pickBtn.setEnabled(false);
+        authBtn.setEnabled(false);
+        browseBtn.setEnabled(false);
+        upBtn.setEnabled(false);
+        useBtn.setEnabled(false);
         depthBtn.setEnabled(false);
         scanBtn.setEnabled(true);
         scanBtn.setText("取消");
@@ -279,7 +393,7 @@ public class MainActivity extends Activity {
         status.setText("阶段 1/2：扫描目录…");
 
         final int candidateDepth = depth;
-        scanner = new SafScanner(this, treeUri, candidateDepth);
+        scanner = new FileScanner(chosenDir, candidateDepth);
 
         new Thread(new Runnable() {
             @Override
@@ -288,7 +402,7 @@ public class MainActivity extends Activity {
                 final List<DirInfo> units = new ArrayList<DirInfo>();
                 long t0 = System.currentTimeMillis();
                 try {
-                    List<DirInfo> scanned = scanner.scanTree(new SafScanner.Progress() {
+                    List<DirInfo> scanned = scanner.scanTree(new FileScanner.Progress() {
                         @Override
                         public void onProgress(int phase, final int done, int total, final String detail) {
                             runOnUiThread(new Runnable() {
@@ -317,7 +431,7 @@ public class MainActivity extends Activity {
                                 status.setText("阶段 2/2：分析封面 0/" + toEnrich.size() + "…");
                             }
                         });
-                        scanner.enrich(toEnrich, new SafScanner.Progress() {
+                        scanner.enrich(toEnrich, new FileScanner.Progress() {
                             @Override
                             public void onProgress(int phase, final int done, int total, final String detail) {
                                 runOnUiThread(new Runnable() {
@@ -344,7 +458,10 @@ public class MainActivity extends Activity {
                     @Override
                     public void run() {
                         busy = false;
-                        pickBtn.setEnabled(true);
+                        authBtn.setEnabled(true);
+                        browseBtn.setEnabled(true);
+                        upBtn.setEnabled(true);
+                        useBtn.setEnabled(true);
                         depthBtn.setEnabled(true);
                         scanBtn.setEnabled(true);
                         scanBtn.setText("扫描");
@@ -361,14 +478,13 @@ public class MainActivity extends Activity {
                         }
                         status.setText(groups.size() + " 组 · 需确认 " + review
                                 + " · 可省 " + Core.human(save)
-                                + " · " + unitCount + " 部 · " + (timeCost / 1000.0) + "s");
+                                + " · " + unitCount + " 部 · " + (timeCost / 1000.0) + "s"
+                                + " · 层数 " + depth);
                         empty.setVisibility(groups.isEmpty() ? View.VISIBLE : View.GONE);
-                        if (groups.isEmpty()) {
-                            empty.setText("没找到重复\n\n可能原因：\n"
-                                    + "· 层数选错了（当前 " + depth + " 层，试试其他）\n"
-                                    + "· 这个目录下没有图片\n"
-                                    + "· 都是压缩包（本轮按 1 包 1 页算）");
-                        }
+                        empty.setText("没找到重复\n\n"
+                                + "· 当前层数 " + depth + "（可改成 1/2/3 试试）\n"
+                                + "· 目录里要有图片（jpg/png/webp）\n"
+                                + "· 已带【待删除】的目录会被跳过");
                     }
                 });
             }
@@ -386,24 +502,23 @@ public class MainActivity extends Activity {
     private Button button(String text) {
         Button b = new Button(this);
         b.setText(text);
-        b.setTextSize(12);
+        b.setTextSize(11);
         b.setAllCaps(false);
         b.setTextColor(TEXT);
+        b.setPadding(0, 0, 0, 0);
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xFF26282C);
-        bg.setCornerRadius(getResources().getDisplayMetrics().density * 20);
+        bg.setCornerRadius(getResources().getDisplayMetrics().density * 18);
         b.setBackground(bg);
         b.setMinHeight(0);
         b.setMinimumHeight(0);
-        b.setPadding((int) (getResources().getDisplayMetrics().density * 14), 0,
-                (int) (getResources().getDisplayMetrics().density * 14), 0);
-        b.setHeight((int) (getResources().getDisplayMetrics().density * 42));
+        b.setHeight((int) (getResources().getDisplayMetrics().density * 40));
         return b;
     }
 
     private LinearLayout.LayoutParams lp(float d, int left, int right) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         p.leftMargin = (int) (d * left);
         p.rightMargin = (int) (d * right);
         return p;

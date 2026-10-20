@@ -8,11 +8,12 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.LruCache;
 
+import java.io.FileInputStream;
 import java.io.InputStream;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** 极简图片加载：LruCache + 按目标尺寸采样，避免 OOM。 */
+/** 极简图片加载：支持 SAF URI 和绝对路径两种来源，LruCache + 采样解码。 */
 public final class ImageLoader {
 
     public interface Callback {
@@ -36,12 +37,12 @@ public final class ImageLoader {
         this.pool = Executors.newFixedThreadPool(3);
     }
 
-    public void load(final String uriStr, final int reqW, final Callback cb) {
-        if (uriStr == null || uriStr.length() == 0) {
+    public void load(final String src, final int reqW, final Callback cb) {
+        if (src == null || src.length() == 0) {
             cb.onBitmap(null);
             return;
         }
-        Bitmap hit = cache.get(uriStr);
+        Bitmap hit = cache.get(src);
         if (hit != null) {
             cb.onBitmap(hit);
             return;
@@ -49,8 +50,8 @@ public final class ImageLoader {
         pool.execute(new Runnable() {
             @Override
             public void run() {
-                final Bitmap bmp = decode(uriStr, reqW);
-                if (bmp != null) cache.put(uriStr, bmp);
+                final Bitmap bmp = decode(src, reqW);
+                if (bmp != null) cache.put(src, bmp);
                 main.post(new Runnable() {
                     @Override
                     public void run() {
@@ -61,11 +62,17 @@ public final class ImageLoader {
         });
     }
 
-    private Bitmap decode(String uriStr, int reqW) {
+    private InputStream open(String src) throws Exception {
+        if (src.startsWith("/")) {
+            return new FileInputStream(src);
+        }
+        return cr.openInputStream(Uri.parse(src));
+    }
+
+    private Bitmap decode(String src, int reqW) {
         InputStream in = null;
         try {
-            Uri u = Uri.parse(uriStr);
-            in = cr.openInputStream(u);
+            in = open(src);
             if (in == null) return null;
             BitmapFactory.Options o = new BitmapFactory.Options();
             o.inJustDecodeBounds = true;
@@ -79,9 +86,8 @@ public final class ImageLoader {
 
             BitmapFactory.Options o2 = new BitmapFactory.Options();
             o2.inSampleSize = sample;
-            in = cr.openInputStream(u);
-            Bitmap bmp = BitmapFactory.decodeStream(in, null, o2);
-            return bmp;
+            in = open(src);
+            return BitmapFactory.decodeStream(in, null, o2);
         } catch (Exception e) {
             return null;
         } finally {
