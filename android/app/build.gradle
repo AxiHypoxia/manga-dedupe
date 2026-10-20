@@ -10,8 +10,8 @@ android {
         applicationId "com.example.mangadedupe"
         minSdk 24
         targetSdk 34
-        versionCode 2
-        versionName "0.2.0-core"
+        versionCode 3
+        versionName "0.3.0-scan-ui"
     }
 
     buildTypes {
@@ -25,7 +25,6 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    // 让 CI 日志里能看到每个用例的 PASS/FAIL
     testOptions {
         unitTests.all {
             testLogging {
@@ -41,10 +40,9 @@ android {
 }
 
 dependencies {
-    // 目前只有 JUnit；下一步加 Compose：
-    //   implementation platform('androidx.compose:compose-bom:2024.06.00')
-    //   implementation 'androidx.activity:activity-compose:1.9.0'
-    //   implementation 'androidx.compose.material3:material3'
-    //   implementation 'androidx.documentfile:documentfile:1.0.1'
+    // 只用最必要的：RecyclerView（网格）+ DocumentFile（SAF 文件名/大小兜底）
+    // 刻意不引 AppCompat / Compose / Coil，减少构建风险；主题用系统 Theme.Material
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.documentfile:documentfile:1.0.1'
     testImplementation 'junit:junit:4.13.2'
 }

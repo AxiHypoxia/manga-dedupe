@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- 只用 SAF（ACTION_OPEN_DOCUMENT_TREE），不需要任何存储权限 -->
+    <!-- 只用 SAF（ACTION_OPEN_DOCUMENT_TREE），不申请任何存储权限 -->
     <application
         android:allowBackup="true"
         android:label="漫画重复筛选"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
 
+        <!-- 让 Material 深色主题的强调色接近设计稿的蓝 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
