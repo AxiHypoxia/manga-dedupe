@@ -2,9 +2,12 @@ package com.example.mangadedupe;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.UriPermission;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -22,13 +25,17 @@ import java.util.List;
 /**
  * 界面：选目录 → 两阶段扫描 → 2 列分组网格。
  *
- * 两阶段的目的（大库优化）：
- *   1) 先只查目录名/页数（不打开图片）→ 先分组
- *   2) 只对"疑似重复组"的成员打开首图 1 次 → 解析宽高 + 哈希 → 重算分组
+ * SAF 授权说明（国产 ROM 常见坑）：
+ *  · 必须带 FLAG_GRANT_PREFIX_URI_PERMISSION，否则部分 ROM 会“允许后反复再问”
+ *  · READ / WRITE 分开申请，写权限被拒不影响只读扫描
+ *  · 选中的目录存进 SharedPreferences，进程被杀也不会丢
  */
 public class MainActivity extends Activity {
 
+    private static final String TAG = "MangaDedupe";
     private static final int REQ_TREE = 1001;
+    private static final String PREFS = "mangadedupe";
+    private static final String KEY_TREE = "tree_uri";
 
     private static final int BG = 0xFF0F0F11;
     private static final int TEXT = 0xFFEDEDEF;
@@ -45,6 +52,7 @@ public class MainActivity extends Activity {
     private Uri treeUri;
     private int depth = 1;
     private boolean busy;
+    private boolean picking;
     private SafScanner scanner;
 
     @Override
@@ -65,7 +73,6 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         status = new TextView(this);
-        status.setText("选一个漫画根目录（会请求读写授权，用于改名标记）");
         status.setTextSize(11);
         status.setTextColor(SUB);
         status.setPadding(0, (int) (d * 4), 0, (int) (d * 8));
@@ -118,6 +125,19 @@ public class MainActivity extends Activity {
         });
         rv.setAdapter(adapter);
 
+        // 恢复上次选的目录
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String saved = sp.getString(KEY_TREE, null);
+        if (saved != null) {
+            try {
+                treeUri = Uri.parse(saved);
+                status.setText("上次选的目录：" + uriName(treeUri) + "\n" + permText(treeUri));
+            } catch (Exception ignored) {
+            }
+        } else {
+            status.setText("选一个漫画根目录（会请求读写授权，用于改名标记）");
+        }
+
         pickBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -150,13 +170,22 @@ public class MainActivity extends Activity {
     // ---------------- SAF ----------------
 
     private void pickTree() {
+        if (picking) {
+            Toast.makeText(this, "授权窗口已经打开了，请在里面操作", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        picking = true;
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        // 关键：PREFIX 标志让整个子树一起授权，部分 ROM 缺它会“允许后反复再问”
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
                 | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
         try {
             startActivityForResult(i, REQ_TREE);
+            Log.i(TAG, "打开目录选择器");
         } catch (Exception e) {
+            picking = false;
             Toast.makeText(this, "打不开目录选择器：" + e, Toast.LENGTH_LONG).show();
         }
     }
@@ -164,17 +193,73 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_TREE || resultCode != RESULT_OK || data == null) return;
-        Uri uri = data.getData();
-        if (uri == null) return;
+        if (requestCode != REQ_TREE) return;
+        picking = false;
+
+        if (resultCode != RESULT_OK) {
+            // 常见于：用户按了返回、或 ROM 把确认框当成了取消
+            status.setText("没有选到目录（结果码 " + resultCode + "）\n再点一次「选目录」，在弹窗里先点「使用此文件夹」再允许");
+            Toast.makeText(this, "未选择目录（结果码 " + resultCode + "）", Toast.LENGTH_LONG).show();
+            Log.w(TAG, "onActivityResult not OK: " + resultCode);
+            return;
+        }
+        Uri uri = data == null ? null : data.getData();
+        if (uri == null) {
+            status.setText("系统返回了空目录（ROM 异常）\n试试：设置 → 应用 → 漫画重复筛选 → 权限 → 存储，手动允许");
+            Toast.makeText(this, "系统返回空目录", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        // READ 与 WRITE 分开申请；WRITE 被拒不影响扫描，只是不能改名
+        boolean readOk = tryPersist(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        boolean writeOk = tryPersist(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+        treeUri = uri;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_TREE, uri.toString()).apply();
+
+        String msg = "已选目录：" + uriName(uri) + "\n" + permText(uri);
+        status.setText(msg);
+        Toast.makeText(this, "已选择：" + uriName(uri)
+                + (writeOk ? "" : "\n（只读：能扫描，暂不能改名标记）"), Toast.LENGTH_LONG).show();
+        Log.i(TAG, "tree=" + uri + " readOk=" + readOk + " writeOk=" + writeOk);
+    }
+
+    private boolean tryPersist(Uri uri, int modeFlag) {
         try {
-            getContentResolver().takePersistableUriPermission(uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            getContentResolver().takePersistableUriPermission(uri, modeFlag);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "takePersistable failed for mode " + modeFlag, e);
+            return false;
+        }
+    }
+
+    private String uriName(Uri uri) {
+        String s = uri.getLastPathSegment();
+        if (s == null) s = uri.toString();
+        int i = s.indexOf(':');
+        if (i >= 0) s = s.substring(i + 1);
+        return s;
+    }
+
+    /** 显示当前已持久化的权限（排查授权问题用） */
+    private String permText(Uri uri) {
+        boolean read = false;
+        boolean write = false;
+        try {
+            List<UriPermission> list = getContentResolver().getPersistedUriPermissions();
+            for (UriPermission p : list) {
+                if (p.getUri().equals(uri)) {
+                    read = p.isReadPermission();
+                    write = p.isWritePermission();
+                }
+            }
         } catch (Exception ignored) {
         }
-        treeUri = uri;
-        status.setText("已选目录：" + uri.getLastPathSegment());
+        String extra = "";
+        if (!read && !write) extra = "\n（未拿到持久授权：能扫描，重启后要重选）";
+        else if (!write) extra = "\n（只读授权：能扫描，不能改名）";
+        return "权限：读" + (read ? " √" : " ×") + " · 写" + (write ? " √" : " ×") + extra;
     }
 
     // ---------------- 两阶段扫描 ----------------
@@ -218,9 +303,7 @@ public class MainActivity extends Activity {
                     units.addAll(scanned);
 
                     if (!scanner.isCancelled()) {
-                        // 先用"名字 + 页数"分一次组
                         final List<Group> rough = Core.groupPairs(units);
-                        // 需要精确判定的组 → 只对这些成员做首图分析
                         final List<DirInfo> toEnrich = new ArrayList<DirInfo>();
                         for (Group g : rough) {
                             if (!Core.needsReview(g.label)) continue;
@@ -252,7 +335,6 @@ public class MainActivity extends Activity {
                 }
                 long cost = System.currentTimeMillis() - t0;
 
-                // 用补全后的数据重算分组（纯 CPU，毫秒级）
                 final List<Group> groups = err.length() == 0
                         ? Core.groupPairs(units) : new ArrayList<Group>();
                 final long timeCost = cost;
