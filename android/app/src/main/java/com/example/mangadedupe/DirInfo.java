@@ -35,6 +35,8 @@ public final class DirInfo {
 
     /** 首图（压缩包里的会解到缓存目录） */
     public String firstImage;
+    /** 首图字节数（算哈希时一起参与，抗“同尺寸不同内容”） */
+    public long firstImageSize;
     /** 首图指纹：大小 + 前 64KB 的 MD5 */
     public String firstHash;
 

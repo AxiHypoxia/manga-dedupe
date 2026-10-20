@@ -2,7 +2,6 @@ package com.example.mangadedupe;
 
 import android.app.Activity;
 import android.content.Intent;
-import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
@@ -21,8 +20,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 轮次 A 的界面：选目录 → SAF 扫描 → 2 列分组网格。
- * 全部用代码搭 UI（不引 layout XML，减少构建风险）。
+ * 界面：选目录 → 两阶段扫描 → 2 列分组网格。
+ *
+ * 两阶段的目的（大库优化）：
+ *   1) 先只查目录名/页数（不打开图片）→ 先分组
+ *   2) 只对"疑似重复组"的成员打开首图 1 次 → 解析宽高 + 哈希 → 重算分组
  */
 public class MainActivity extends Activity {
 
@@ -31,26 +33,23 @@ public class MainActivity extends Activity {
     private static final int BG = 0xFF0F0F11;
     private static final int TEXT = 0xFFEDEDEF;
     private static final int SUB = 0xFF8A8D94;
-    private static final int ACCENT = 0xFF4C8DFF;
 
-    private TextView title;
     private TextView status;
     private TextView empty;
     private Button pickBtn;
     private Button depthBtn;
     private Button scanBtn;
-    private RecyclerView rv;
     private GroupAdapter adapter;
     private ImageLoader loader;
 
     private Uri treeUri;
     private int depth = 1;
     private boolean busy;
+    private SafScanner scanner;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-
         final float d = getResources().getDisplayMetrics().density;
 
         LinearLayout root = new LinearLayout(this);
@@ -59,8 +58,7 @@ public class MainActivity extends Activity {
         int pad = (int) (d * 14);
         root.setPadding(pad, (int) (d * 10), pad, 0);
 
-        // ---- 顶部标题 ----
-        title = new TextView(this);
+        TextView title = new TextView(this);
         title.setText("漫画重复筛选");
         title.setTextSize(19);
         title.setTextColor(TEXT);
@@ -73,7 +71,6 @@ public class MainActivity extends Activity {
         status.setPadding(0, (int) (d * 4), 0, (int) (d * 8));
         root.addView(status);
 
-        // ---- 按钮行 ----
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         root.addView(bar);
@@ -87,15 +84,12 @@ public class MainActivity extends Activity {
         scanBtn = button("扫描");
         bar.addView(scanBtn, lp(d, 0, 0));
 
-        // ---- 列表 ----
-        rv = new RecyclerView(this);
+        RecyclerView rv = new RecyclerView(this);
         LinearLayout.LayoutParams rvlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         rvlp.topMargin = (int) (d * 10);
         root.addView(rv, rvlp);
-
-        GridLayoutManager glm = new GridLayoutManager(this, 2);
-        rv.setLayoutManager(glm);
+        rv.setLayoutManager(new GridLayoutManager(this, 2));
         rv.addItemDecoration(new GridSpace((int) (d * 6)));
 
         empty = new TextView(this);
@@ -142,7 +136,13 @@ public class MainActivity extends Activity {
         scanBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                startScan();
+                if (busy) {
+                    if (scanner != null) scanner.cancel();
+                    scanBtn.setText("取消中…");
+                    scanBtn.setEnabled(false);
+                } else {
+                    startScan();
+                }
             }
         });
     }
@@ -177,10 +177,9 @@ public class MainActivity extends Activity {
         status.setText("已选目录：" + uri.getLastPathSegment());
     }
 
-    // ---------------- 扫描 ----------------
+    // ---------------- 两阶段扫描 ----------------
 
     private void startScan() {
-        if (busy) return;
         if (treeUri == null) {
             Toast.makeText(this, "先点「选目录」", Toast.LENGTH_SHORT).show();
             return;
@@ -188,46 +187,77 @@ public class MainActivity extends Activity {
         busy = true;
         pickBtn.setEnabled(false);
         depthBtn.setEnabled(false);
-        scanBtn.setEnabled(false);
-        scanBtn.setText("扫描中…");
+        scanBtn.setEnabled(true);
+        scanBtn.setText("取消");
         empty.setVisibility(View.GONE);
         adapter.setData(new ArrayList<Group>());
-        status.setText("正在扫描…");
+        status.setText("阶段 1/2：扫描目录…");
 
         final int candidateDepth = depth;
+        scanner = new SafScanner(this, treeUri, candidateDepth);
+
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final List<Group> groups = new ArrayList<Group>();
-                String err = null;
+                final StringBuilder err = new StringBuilder();
+                final List<DirInfo> units = new ArrayList<DirInfo>();
+                long t0 = System.currentTimeMillis();
                 try {
-                    SafScanner scanner = new SafScanner(MainActivity.this, treeUri, candidateDepth);
-                    List<DirInfo> all = scanner.scan(new SafScanner.Progress() {
+                    List<DirInfo> scanned = scanner.scanTree(new SafScanner.Progress() {
                         @Override
-                        public void onProgress(final int dirs, final String rel) {
+                        public void onProgress(int phase, final int done, int total, final String detail) {
                             runOnUiThread(new Runnable() {
                                 @Override
                                 public void run() {
-                                    status.setText("扫描中… 已扫 " + dirs + " 个目录"
-                                            + (rel.isEmpty() ? "" : " · " + tail(rel)));
+                                    status.setText("阶段 1/2：扫描目录 " + done + " 个"
+                                            + (detail.isEmpty() ? "" : " · " + tail(detail)));
                                 }
                             });
                         }
                     });
-                    List<DirInfo> units = new ArrayList<DirInfo>();
-                    for (DirInfo di : all) {
-                        if (di.depth != candidateDepth) continue;
-                        if (Core.isMarked(di.name)) continue;
-                        if (di.pages <= 0) continue;
-                        units.add(di);
-                    }
-                    groups.addAll(Core.groupPairs(units));
-                } catch (Throwable t) {
-                    err = String.valueOf(t);
-                }
+                    units.addAll(scanned);
 
-                final String ferr = err;
-                final int unitCount = groups.size();
+                    if (!scanner.isCancelled()) {
+                        // 先用"名字 + 页数"分一次组
+                        final List<Group> rough = Core.groupPairs(units);
+                        // 需要精确判定的组 → 只对这些成员做首图分析
+                        final List<DirInfo> toEnrich = new ArrayList<DirInfo>();
+                        for (Group g : rough) {
+                            if (!Core.needsReview(g.label)) continue;
+                            for (DirInfo m : g.members) {
+                                if (!toEnrich.contains(m)) toEnrich.add(m);
+                            }
+                        }
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                status.setText("阶段 2/2：分析封面 0/" + toEnrich.size() + "…");
+                            }
+                        });
+                        scanner.enrich(toEnrich, new SafScanner.Progress() {
+                            @Override
+                            public void onProgress(int phase, final int done, int total, final String detail) {
+                                runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        status.setText("阶段 2/2：分析封面 " + done + "/" + total
+                                                + " · " + tail(detail));
+                                    }
+                                });
+                            }
+                        });
+                    }
+                } catch (Throwable t) {
+                    err.append(t);
+                }
+                long cost = System.currentTimeMillis() - t0;
+
+                // 用补全后的数据重算分组（纯 CPU，毫秒级）
+                final List<Group> groups = err.length() == 0
+                        ? Core.groupPairs(units) : new ArrayList<Group>();
+                final long timeCost = cost;
+                final int unitCount = units.size();
+
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
@@ -236,8 +266,8 @@ public class MainActivity extends Activity {
                         depthBtn.setEnabled(true);
                         scanBtn.setEnabled(true);
                         scanBtn.setText("扫描");
-                        if (ferr != null) {
-                            status.setText("扫描失败：" + ferr);
+                        if (err.length() > 0) {
+                            status.setText("扫描失败：" + err);
                             return;
                         }
                         adapter.setData(groups);
@@ -248,10 +278,14 @@ public class MainActivity extends Activity {
                             save += g.saveBytes();
                         }
                         status.setText(groups.size() + " 组 · 需确认 " + review
-                                + " · 可省 " + Core.human(save));
+                                + " · 可省 " + Core.human(save)
+                                + " · " + unitCount + " 部 · " + (timeCost / 1000.0) + "s");
                         empty.setVisibility(groups.isEmpty() ? View.VISIBLE : View.GONE);
                         if (groups.isEmpty()) {
-                            empty.setText("没找到重复\n\n可能原因：\n· 层数选错了（试试 2 层）\n· 目录里是压缩包（本轮按 1 包 1 页算，下一轮支持精确页数）");
+                            empty.setText("没找到重复\n\n可能原因：\n"
+                                    + "· 层数选错了（当前 " + depth + " 层，试试其他）\n"
+                                    + "· 这个目录下没有图片\n"
+                                    + "· 都是压缩包（本轮按 1 包 1 页算）");
                         }
                     }
                 });
@@ -296,10 +330,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (scanner != null) scanner.cancel();
         if (loader != null) loader.shutdown();
     }
 
-    /** 网格间距 */
     static final class GridSpace extends RecyclerView.ItemDecoration {
         private final int half;
 

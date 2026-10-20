@@ -17,45 +17,55 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * 用 SAF 扫描一个目录树，产出 Core 需要的 DirInfo 列表。
+ * 两阶段扫描（针对"文件夹多、文件大"的库优化）：
  *
- * 性能取舍（重要）：
- *  · 文件数/体积/图片数/页数：每层一次 query，全量统计（便宜）
- *  · 分辨率采样 / 首图 / 首图哈希：**只对候选层（candidateDepth）做**，因为只有它们参与判定
- *  · 页级指纹：本轮不做（要对每页读头，代价高），下一轮按需对“需确认的组”算
- *  · .cbz/.zip 的页数：本轮按“1 个压缩包 = 1 页”处理（TODO: 缓存到私有目录后用 ZipFile 精确数）
+ *   阶段 1 scanTree()  只查目录/文件/页数 —— 不打开任何图片，只走 SAF query
+ *   阶段 2 enrich()    只对"疑似重复组"的成员打开首图一次，从文件头解析宽高 + 算哈希
+ *
+ * 和旧版相比：宽高不再靠 BitmapFactory 解码（每次都要走解码器），
+ * 而是直接读文件头（ImgHead），每目录的 IO 次数从 6 次降到 1 次；
+ * 且只有候选组的成员才需要这 1 次。
  */
 public final class SafScanner {
 
     private static final String TAG = "SafScanner";
-    private static final int MAX_SAMPLE = 5;
+    public static final int PHASE_DIRS = 1;
+    public static final int PHASE_IMAGES = 2;
 
     public interface Progress {
-        /** @param dirs  已扫描目录数
-         *  @param rel   当前目录相对路径（给用户看） */
-        void onProgress(int dirs, String rel);
+        void onProgress(int phase, int done, int total, String detail);
     }
 
-    private final Context ctx;
     private final ContentResolver cr;
     private final Uri treeUri;
     private final int maxDepth;
     private final int candidateDepth;
+    private final AtomicBoolean cancel = new AtomicBoolean(false);
 
     private int dirCount;
 
     public SafScanner(Context ctx, Uri treeUri, int candidateDepth) {
-        this.ctx = ctx;
         this.cr = ctx.getContentResolver();
         this.treeUri = treeUri;
         this.candidateDepth = candidateDepth;
-        this.maxDepth = Math.max(6, candidateDepth + 3);
+        this.maxDepth = Math.max(6, candidateDepth + 4);
     }
 
-    /** 扫描并返回全部目录（含递归聚合值）。候选层由调用方按 depth 过滤。 */
-    public List<DirInfo> scan(Progress cb) {
+    public void cancel() {
+        cancel.set(true);
+    }
+
+    public boolean isCancelled() {
+        return cancel.get();
+    }
+
+    // ================= 阶段 1：只查目录 =================
+
+    /** 返回候选层（candidateDepth）目录，页数>0 且未标记。 */
+    public List<DirInfo> scanTree(Progress cb) {
         Map<String, DirInfo> all = new HashMap<String, DirInfo>();
         dirCount = 0;
         String rootId;
@@ -67,7 +77,7 @@ public final class SafScanner {
         }
         walk(rootId, "", 0, all, cb);
 
-        // 自底向上聚合到父目录（按 rel 深度倒序）
+        // 自底向上聚合
         List<DirInfo> list = new ArrayList<DirInfo>(all.values());
         Collections.sort(list, new Comparator<DirInfo>() {
             @Override
@@ -77,8 +87,7 @@ public final class SafScanner {
         });
         for (DirInfo d : list) {
             if (d.depth == 0) continue;
-            String parentRel = parentOf(d.rel);
-            DirInfo p = all.get(parentRel);
+            DirInfo p = all.get(parentOf(d.rel));
             if (p == null) continue;
             p.files += d.files;
             p.images += d.images;
@@ -86,10 +95,16 @@ public final class SafScanner {
             p.bytes += d.bytes;
             p.nums.addAll(d.nums);
         }
-        return list;
-    }
 
-    // ---------------- 递归 ----------------
+        List<DirInfo> units = new ArrayList<DirInfo>();
+        for (DirInfo d : list) {
+            if (d.depth != candidateDepth) continue;
+            if (d.pages <= 0) continue;
+            if (Core.isMarked(d.name)) continue;
+            units.add(d);
+        }
+        return units;
+    }
 
     private DirInfo walk(String docId, String rel, int depth,
                          Map<String, DirInfo> out, Progress cb) {
@@ -98,20 +113,17 @@ public final class SafScanner {
         d.rel = rel;
         d.name = rel.isEmpty() ? "/" : lastName(rel);
         d.depth = depth;
-        if (!rel.isEmpty()) {
-            d.nums.addAll(Core.volNumbers(d.name));
-        }
+        if (!rel.isEmpty()) d.nums.addAll(Core.volNumbers(d.name));
         out.put(rel, d);
+
         dirCount++;
-        if (cb != null && (dirCount % 25 == 0 || depth == 0)) {
-            cb.onProgress(dirCount, rel);
+        if (cb != null && (dirCount % 20 == 0 || depth == 0)) {
+            cb.onProgress(PHASE_DIRS, dirCount, 0, rel);
         }
-        if (depth >= maxDepth) return d;
+        if (cancel.get() || depth >= maxDepth) return d;
 
-        List<String[]> subDirs = new ArrayList<String[]>();   // {docId, name}
-        List<ImageRef> images = new ArrayList<ImageRef>();    // 直接图片，按名字排序用
-        long archiveCount = 0;
-
+        List<String[]> subDirs = new ArrayList<String[]>();
+        List<String[]> images = new ArrayList<String[]>();   // {docId, name}
         Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId);
         Cursor c = null;
         try {
@@ -135,12 +147,11 @@ public final class SafScanner {
                 if (Core.isImageName(nm)) {
                     d.images++;
                     d.pages++;
-                    images.add(new ImageRef(id, nm, size));
+                    images.add(new String[]{id, nm, String.valueOf(size)});
                 } else if (Core.isArchiveName(nm)) {
-                    // TODO: 精确页数（下一轮缓存到私有目录用 ZipFile 数）
+                    // TODO(轮次 B)：缓存到私有目录后 ZipFile 精确数页
                     d.pages += 1;
                     d.nums.addAll(Core.volNumbers(nm));
-                    archiveCount++;
                 }
             }
         } catch (Exception e) {
@@ -149,85 +160,109 @@ public final class SafScanner {
             if (c != null) c.close();
         }
 
-        // 只对候选层做重活：分辨率采样 / 首图 / 首图哈希
-        if (depth == candidateDepth && d.pages > 0) {
-            Collections.sort(images, new Comparator<ImageRef>() {
+        // 只在候选层挑"首图"（按文件名排序取第一张），但不打开它
+        if (depth == candidateDepth && !images.isEmpty()) {
+            Collections.sort(images, new Comparator<String[]>() {
                 @Override
-                public int compare(ImageRef a, ImageRef b) {
-                    return a.name.compareTo(b.name);
+                public int compare(String[] a, String[] b) {
+                    return a[1].compareTo(b[1]);
                 }
             });
-            int sample = 0;
-            for (ImageRef img : images) {
-                if (sample >= MAX_SAMPLE) break;
-                Uri u = documentUri(img.docId);
-                int[] wh = bounds(u);
-                if (wh[0] > 0 && wh[1] > 0) {
-                    d.sumW += wh[0];
-                    d.sumH += wh[1];
-                    d.sampleN++;
-                    sample++;
-                }
-            }
-            if (!images.isEmpty()) {
-                ImageRef first = images.get(0);
-                d.firstImage = documentUri(first.docId).toString();
-                if (first.size > 0) {
-                    d.firstHash = headHash(documentUri(first.docId), first.size);
-                }
+            String[] first = images.get(0);
+            d.firstImage = documentUri(first[0]).toString();
+            try {
+                d.firstImageSize = Long.parseLong(first[2]);
+            } catch (NumberFormatException ignored) {
             }
         }
 
-        // 递归子目录
         for (String[] sd : subDirs) {
+            if (cancel.get()) break;
             String childRel = rel.isEmpty() ? sd[1] : rel + "/" + sd[1];
             walk(sd[0], childRel, depth + 1, out, cb);
         }
         return d;
     }
 
-    // ---------------- 小工具 ----------------
+    // ================= 阶段 2：只分析首图 =================
 
-    private Uri documentUri(String docId) {
-        return DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
-    }
-
-    /** 只读文件头拿宽高，不解码整图 */
-    private int[] bounds(Uri uri) {
-        InputStream in = null;
-        try {
-            in = cr.openInputStream(uri);
-            BitmapFactory.Options o = new BitmapFactory.Options();
-            o.inJustDecodeBounds = true;
-            BitmapFactory.decodeStream(in, null, o);
-            return new int[]{o.outWidth, o.outHeight};
-        } catch (Exception e) {
-            return new int[]{0, 0};
-        } finally {
-            closeQuietly(in);
+    /** 对给定目录（通常是疑似重复组里的成员）打开首图一次，解析宽高 + 首图哈希。 */
+    public void enrich(List<DirInfo> units, Progress cb) {
+        int total = units.size();
+        int done = 0;
+        for (DirInfo d : units) {
+            if (cancel.get()) return;
+            if (d.firstImage != null
+                    && (d.sampleN == 0 || d.firstHash == null || d.firstHash.length() == 0)) {
+                enrichOne(d);
+            }
+            done++;
+            if (cb != null && (done % 3 == 0 || done == total)) {
+                cb.onProgress(PHASE_IMAGES, done, total, d.name);
+            }
         }
     }
 
-    /** 首图指纹：文件大小 + 前 64KB 的 MD5 */
-    private String headHash(Uri uri, long size) {
+    private void enrichOne(DirInfo d) {
         InputStream in = null;
         try {
-            in = cr.openInputStream(uri);
+            Uri u = Uri.parse(d.firstImage);
+            in = cr.openInputStream(u);
+            if (in == null) return;
             byte[] buf = new byte[64 * 1024];
-            int n = in.read(buf);
-            if (n <= 0) return "";
+            int n = 0;
+            int r;
+            while (n < buf.length && (r = in.read(buf, n, buf.length - n)) > 0) n += r;
+            if (n <= 0) return;
+
+            // 宽高：直接解析文件头（微秒级），失败才退回解码器
+            int[] wh = ImgHead.size(buf, n);
+            if (wh[0] > 0 && wh[1] > 0) {
+                d.sumW = wh[0];
+                d.sumH = wh[1];
+                d.sampleN = 1;
+            } else {
+                slowBounds(d, u);
+            }
+
+            // 哈希：大小 + 前 64KB
             MessageDigest md = MessageDigest.getInstance("MD5");
             md.update(buf, 0, n);
-            md.update(String.valueOf(size).getBytes("UTF-8"));
+            md.update(String.valueOf(d.firstImageSize).getBytes("UTF-8"));
             byte[] h = md.digest();
             StringBuilder sb = new StringBuilder();
             for (byte b : h) sb.append(String.format("%02x", b));
-            return sb.toString();
+            d.firstHash = sb.toString();
         } catch (Exception e) {
-            return "";
+            Log.w(TAG, "enrich failed: " + d.name, e);
         } finally {
             closeQuietly(in);
         }
+    }
+
+    private void slowBounds(DirInfo d, Uri u) {
+        InputStream in = null;
+        try {
+            in = cr.openInputStream(u);
+            if (in == null) return;
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            BitmapFactory.decodeStream(in, null, o);
+            if (o.outWidth > 0 && o.outHeight > 0) {
+                d.sumW = o.outWidth;
+                d.sumH = o.outHeight;
+                d.sampleN = 1;
+            }
+        } catch (Exception ignored) {
+        } finally {
+            closeQuietly(in);
+        }
+    }
+
+    // ================= 小工具 =================
+
+    private Uri documentUri(String docId) {
+        return DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
     }
 
     private static void closeQuietly(InputStream in) {
@@ -247,17 +282,5 @@ public final class SafScanner {
     static String lastName(String rel) {
         int i = rel.lastIndexOf('/');
         return i < 0 ? rel : rel.substring(i + 1);
-    }
-
-    private static final class ImageRef {
-        final String docId;
-        final String name;
-        final long size;
-
-        ImageRef(String docId, String name, long size) {
-            this.docId = docId;
-            this.name = name;
-            this.size = size;
-        }
     }
 }
