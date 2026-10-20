@@ -76,7 +76,12 @@ public class MainActivity extends Activity {
         root.setPadding(pad, (int) (d * 8), pad, 0);
 
         TextView title = new TextView(this);
-        title.setText("漫画重复筛选");
+        String ver = "";
+        try {
+            ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception ignored) {
+        }
+        title.setText("漫画重复筛选  v" + ver);
         title.setTextSize(19);
         title.setTextColor(TEXT);
         root.addView(title);
